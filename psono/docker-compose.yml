@@ -1,0 +1,375 @@
+x-psono-secrets: &psono-secrets
+  PSONO_SECRET_KEY: ${PSONO_SECRET_KEY:-}
+  PSONO_PRIVATE_KEY: ${PSONO_PRIVATE_KEY:-}
+  PSONO_PUBLIC_KEY: ${PSONO_PUBLIC_KEY:-}
+  PSONO_ACTIVATION_LINK_SECRET: ${PSONO_ACTIVATION_LINK_SECRET:-}
+  PSONO_DB_SECRET: ${PSONO_DB_SECRET:-}
+  PSONO_EMAIL_SECRET_SALT: ${PSONO_EMAIL_SECRET_SALT:-}
+
+x-psono-env: &psono-env
+  <<: *psono-secrets
+
+  PSONO_HOST_URL: https://${PSONO_DOMAIN:-vault.example.com}/server
+  PSONO_WEB_CLIENT_URL: https://${PSONO_DOMAIN:-vault.example.com}
+  PSONO_ALLOWED_HOSTS: ${PSONO_DOMAIN:-vault.example.com},localhost,127.0.0.1
+
+  # Keep this equal to PSONO_DOMAIN unless you have a very specific reason not to.
+  # Psono API / clients expect the register/backend domain to match the server domain.
+  PSONO_ALLOWED_DOMAINS: ${PSONO_ALLOWED_DOMAINS:-vault.example.com}
+
+  PSONO_NUM_PROXIES: "2"
+  PSONO_DEBUG: "False"
+  PSONO_MANAGEMENT_ENABLED: "True"
+
+  PSONO_DATABASE_URL: postgres://${POSTGRES_USER:-psono}:${POSTGRES_PASSWORD:-}@psono-db:5432/${POSTGRES_DB:-psono}
+
+  PSONO_AUTHENTICATION_METHODS: AUTHKEY
+
+  PSONO_DISABLE_EMAIL_NEW_LOGIN: "True"
+  PSONO_DISABLE_EMAIL_NEW_SHARE_CREATED: "True"
+  PSONO_DISABLE_EMAIL_NEW_GROUP_SHARE_CREATED: "True"
+  PSONO_DISABLE_EMAIL_NEW_GROUP_MEMBERSHIP_CREATED: "True"
+
+  PSONO_EMAIL_BACKEND: ${PSONO_EMAIL_BACKEND:-anymail.backends.brevo.EmailBackend}
+  PSONO_EMAIL_FROM: ${PSONO_EMAIL_FROM:-no-reply@example.com}
+  PSONO_BREVO_API_KEY: ${PSONO_BREVO_API_KEY:-REPLACE_WITH_BREVO_API_KEY}
+  PSONO_BREVO_API_URL: ${PSONO_BREVO_API_URL:-https://api.brevo.com/v3/}
+  PSONO_ANYMAIL_IGNORE_UNSUPPORTED_FEATURES: ${PSONO_ANYMAIL_IGNORE_UNSUPPORTED_FEATURES:-True}
+
+services:
+  psono-keygen:
+    image: psono/psono-combo:latest
+    container_name: psono-keygen
+    restart: "no"
+    environment:
+      KGEN_POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      KGEN_PSONO_SECRET_KEY: ${PSONO_SECRET_KEY:-}
+      KGEN_PSONO_PRIVATE_KEY: ${PSONO_PRIVATE_KEY:-}
+      KGEN_PSONO_PUBLIC_KEY: ${PSONO_PUBLIC_KEY:-}
+      KGEN_PSONO_ACTIVATION_LINK_SECRET: ${PSONO_ACTIVATION_LINK_SECRET:-}
+      KGEN_PSONO_DB_SECRET: ${PSONO_DB_SECRET:-}
+      KGEN_PSONO_EMAIL_SECRET_SALT: ${PSONO_EMAIL_SECRET_SALT:-}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        unset PSONO_SECRET_KEY
+        unset PSONO_PRIVATE_KEY
+        unset PSONO_PUBLIC_KEY
+        unset PSONO_ACTIVATION_LINK_SECRET
+        unset PSONO_DB_SECRET
+        unset PSONO_EMAIL_SECRET_SALT
+
+        if [ -z "$$KGEN_POSTGRES_PASSWORD" ] ||
+           [ -z "$$KGEN_PSONO_SECRET_KEY" ] ||
+           [ -z "$$KGEN_PSONO_PRIVATE_KEY" ] ||
+           [ -z "$$KGEN_PSONO_PUBLIC_KEY" ] ||
+           [ -z "$$KGEN_PSONO_ACTIVATION_LINK_SECRET" ] ||
+           [ -z "$$KGEN_PSONO_DB_SECRET" ] ||
+           [ -z "$$KGEN_PSONO_EMAIL_SECRET_SALT" ]; then
+
+          echo ""
+          echo "============================================================"
+          echo " PSONO - COPY THIS COMPLETE ENV INTO DOKPLOY"
+          echo "============================================================"
+          echo ""
+
+          python3 - <<'PY'
+        import secrets
+        import string
+
+        alphabet = string.ascii_letters + string.digits
+        postgres_password = ''.join(secrets.choice(alphabet) for _ in range(48))
+
+        print("PSONO_DOMAIN=vault.example.com")
+        print("PSONO_USER_DOMAIN=vault.example.com")
+        print("PSONO_ALLOWED_DOMAINS=vault.example.com")
+        print("PSONO_TITLE=Psono Vault")
+        print("PSONO_ALLOW_REGISTRATION=true")
+        print("PSONO_ALLOW_LOST_PASSWORD=false")
+        print("")
+        print("POSTGRES_DB=psono")
+        print("POSTGRES_USER=psono")
+        print(f"POSTGRES_PASSWORD={postgres_password}")
+        print("")
+        print("PSONO_EMAIL_BACKEND=anymail.backends.brevo.EmailBackend")
+        print("PSONO_EMAIL_FROM=no-reply@example.com")
+        print("PSONO_BREVO_API_KEY=REPLACE_WITH_BREVO_API_KEY")
+        print("PSONO_BREVO_API_URL=https://api.brevo.com/v3/")
+        print("PSONO_ANYMAIL_IGNORE_UNSUPPORTED_FEATURES=True")
+        print("")
+        PY
+
+          python3 ./psono/manage.py generateserverkeys > /tmp/psono-keys.raw
+
+          python3 - <<'PY'
+        import re
+
+        wanted = {
+            "SECRET_KEY",
+            "PRIVATE_KEY",
+            "PUBLIC_KEY",
+            "ACTIVATION_LINK_SECRET",
+            "DB_SECRET",
+            "EMAIL_SECRET_SALT",
+        }
+
+        with open("/tmp/psono-keys.raw", "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                match = re.match(r"\A([A-Z_]+):\s*'?(.*?)'?\s*\Z", line)
+                if not match:
+                    continue
+
+                key, value = match.group(1), match.group(2)
+
+                if key not in wanted:
+                    continue
+
+                if key == "EMAIL_SECRET_SALT":
+                    # Docker Compose / Dokploy can interpret "$..." inside env values.
+                    # The log prints this salt already escaped for copy/paste into Dokploy.
+                    # Example:
+                    #   PSONO_EMAIL_SECRET_SALT=$$2b$$12$$...
+                    # Inside the running container it must become:
+                    #   PSONO_EMAIL_SECRET_SALT=$2b$12$...
+                    value = value.replace(chr(36), chr(36) * 2)
+
+                print(f"PSONO_{key}={value}")
+        PY
+
+          echo ""
+          echo "============================================================"
+          echo " Before redeploying:"
+          echo " - Replace vault.example.com with your real vault domain"
+          echo " - Keep PSONO_USER_DOMAIN equal to PSONO_DOMAIN"
+          echo " - Keep PSONO_ALLOWED_DOMAINS equal to PSONO_DOMAIN"
+          echo " - Replace no-reply@example.com with your Brevo verified sender"
+          echo " - Replace REPLACE_WITH_BREVO_API_KEY with your Brevo API key"
+          echo ""
+          echo " Example:"
+          echo " PSONO_DOMAIN=vault.dalego.com"
+          echo " PSONO_USER_DOMAIN=vault.dalego.com"
+          echo " PSONO_ALLOWED_DOMAINS=vault.dalego.com"
+          echo " PSONO_EMAIL_FROM=no-reply@dalego.com"
+          echo ""
+          echo " IMPORTANT:"
+          echo " PSONO_EMAIL_SECRET_SALT is already printed escaped for Dokploy."
+          echo " Copy it exactly as shown in this log."
+          echo ""
+          echo " Do not set PSONO_SECURE_PROXY_SSL_HEADER."
+          echo " Do not manually edit generated PSONO_* keys."
+          echo " After creating your user, set PSONO_ALLOW_REGISTRATION=false."
+          echo "============================================================"
+          echo ""
+
+        else
+          echo ""
+          echo "============================================================"
+          echo " PSONO - ENV ALREADY CONFIGURED"
+          echo "============================================================"
+          echo "Nothing to generate. Do not copy new keys."
+          echo ""
+        fi
+    networks:
+      - psono
+
+  psono-db:
+    image: postgres:17-alpine
+    container_name: psono-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-psono}
+      POSTGRES_USER: ${POSTGRES_USER:-psono}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        if [ -z "$$POSTGRES_PASSWORD" ]; then echo ""; echo "============================================================"; echo " POSTGRES NOT STARTED"; echo "============================================================"; echo "POSTGRES_PASSWORD is missing."; echo "Open the psono-keygen logs, copy the generated ENV into Dokploy, then redeploy."; echo "============================================================"; echo ""; tail -f /dev/null; fi
+        exec docker-entrypoint.sh postgres
+    volumes:
+      - psono_pg_data:/var/lib/postgresql/data
+    expose:
+      - "5432"
+    networks:
+      - psono
+
+  psono-combo:
+    image: psono/psono-combo:latest
+    container_name: psono-combo
+    restart: unless-stopped
+    depends_on:
+      - psono-db
+    environment:
+      <<: *psono-env
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      PSONO_ALLOW_REGISTRATION_RAW: ${PSONO_ALLOW_REGISTRATION:-true}
+      PSONO_ALLOW_LOST_PASSWORD_RAW: ${PSONO_ALLOW_LOST_PASSWORD:-false}
+      PSONO_DOMAIN_RAW: ${PSONO_DOMAIN:-vault.example.com}
+      PSONO_USER_DOMAIN_RAW: ${PSONO_USER_DOMAIN:-vault.example.com}
+      PSONO_TITLE_RAW: ${PSONO_TITLE:-Psono Vault}
+    ports:
+      - "10200:80"
+    expose:
+      - "80"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=dokploy-network"
+      - "traefik.http.routers.psono-vault.rule=Host(`${PSONO_DOMAIN:-vault.example.com}`)"
+      - "traefik.http.routers.psono-vault.entrypoints=web"
+      - "traefik.http.routers.psono-vault.service=psono-vault"
+      - "traefik.http.services.psono-vault.loadbalancer.server.port=80"
+      - "traefik.http.services.psono-vault.loadbalancer.healthcheck.path=/config.json"
+      - "traefik.http.services.psono-vault.loadbalancer.healthcheck.interval=10s"
+      - "traefik.http.services.psono-vault.loadbalancer.healthcheck.timeout=3s"
+    sysctls:
+      net.core.somaxconn: 65535
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - |
+          curl -fsS http://localhost/config.json | python3 -m json.tool >/dev/null &&
+          curl -fsS http://localhost/server/healthcheck/ >/dev/null
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    command:
+      - /bin/sh
+      - -c
+      - |
+        if [ -z "$$POSTGRES_PASSWORD" ] ||
+           [ -z "$$PSONO_SECRET_KEY" ] ||
+           [ -z "$$PSONO_PRIVATE_KEY" ] ||
+           [ -z "$$PSONO_PUBLIC_KEY" ] ||
+           [ -z "$$PSONO_ACTIVATION_LINK_SECRET" ] ||
+           [ -z "$$PSONO_DB_SECRET" ] ||
+           [ -z "$$PSONO_EMAIL_SECRET_SALT" ]; then
+
+          echo ""
+          echo "============================================================"
+          echo " PSONO NOT STARTED"
+          echo "============================================================"
+          echo "Required env vars are missing."
+          echo "Open the psono-keygen logs, copy the generated ENV into Dokploy, then redeploy."
+          echo "============================================================"
+          echo ""
+
+          tail -f /dev/null
+        fi
+
+        write_psono_config() {
+          python3 - <<'PY'
+        import json
+        import os
+
+        def truthy(value):
+            return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+        domain = os.getenv("PSONO_DOMAIN_RAW", "vault.example.com").strip()
+
+        # Keep register/backend domain equal to server domain.
+        # This avoids client/API mismatch problems.
+        user_domain = os.getenv("PSONO_USER_DOMAIN_RAW", domain).strip()
+        if not user_domain or user_domain == "*":
+            user_domain = domain
+
+        title = os.getenv("PSONO_TITLE_RAW", "Psono Vault").strip()
+
+        allow_registration = truthy(os.getenv("PSONO_ALLOW_REGISTRATION_RAW", "true"))
+        allow_lost_password = truthy(os.getenv("PSONO_ALLOW_LOST_PASSWORD_RAW", "false"))
+
+        backend_server = {
+            "title": title,
+            "url": f"https://{domain}/server",
+            "domain": user_domain,
+        }
+
+        config = {
+            "backend_servers": [backend_server],
+            "base_url": f"https://{domain}/",
+            "allow_custom_server": True,
+            "allow_registration": allow_registration,
+            "allow_lost_password": allow_lost_password,
+            "disable_download_bar": False,
+            "remember_me_default": False,
+            "trust_device_default": False,
+            "authentication_methods": ["AUTHKEY"],
+            "saml_provider": [],
+        }
+
+        paths = [
+            "/usr/share/nginx/html/config.json",
+            "/usr/share/nginx/html/portal/config.json",
+        ]
+
+        for path in paths:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(config, f, separators=(",", ":"))
+                f.write("\n")
+
+            with open(path, "r", encoding="utf-8") as f:
+                json.load(f)
+
+        print(json.dumps(config, separators=(",", ":")))
+        PY
+        }
+
+        echo "Writing Psono web client config.json..."
+        CONFIG_JSON="$$(write_psono_config)"
+
+        echo "============================================================"
+        echo "Generated Psono web client config:"
+        echo "$$CONFIG_JSON"
+        echo "============================================================"
+
+        echo "Waiting for Postgres..."
+        python3 - <<'PY'
+        import socket
+        import time
+        import sys
+
+        host = "psono-db"
+        port = 5432
+
+        for attempt in range(60):
+            try:
+                with socket.create_connection((host, port), timeout=2):
+                    print("Postgres is reachable.")
+                    sys.exit(0)
+            except OSError:
+                time.sleep(2)
+
+        print("Postgres did not become reachable in time.")
+        sys.exit(1)
+        PY
+
+        python3 ./psono/manage.py migrate
+
+        echo "Starting Psono combo..."
+        /bin/sh /root/configs/docker/cmd.sh &
+        PSONO_PID="$$!"
+
+        trap 'kill -TERM "$$PSONO_PID" 2>/dev/null || true' TERM INT
+
+        for i in $$(seq 1 60); do
+          write_psono_config >/dev/null || true
+          sleep 1
+        done
+
+        wait "$$PSONO_PID"
+    networks:
+      - psono
+      - dokploy-network
+
+volumes:
+  psono_pg_data:
+
+networks:
+  psono:
+    driver: bridge
+  dokploy-network:
+    external: true
