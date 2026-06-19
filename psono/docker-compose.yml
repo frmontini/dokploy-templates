@@ -127,12 +127,6 @@ services:
                     continue
 
                 if key == "EMAIL_SECRET_SALT":
-                    # Docker Compose / Dokploy can interpret "$..." inside env values.
-                    # The log prints this salt already escaped for copy/paste into Dokploy.
-                    # Example:
-                    #   PSONO_EMAIL_SECRET_SALT=$$2b$$12$$...
-                    # Inside the running container it must become:
-                    #   PSONO_EMAIL_SECRET_SALT=$2b$12$...
                     value = value.replace(chr(36), chr(36) * 2)
 
                 print(f"PSONO_{key}={value}")
@@ -223,9 +217,6 @@ services:
     sysctls:
       net.core.somaxconn: 65535
 
-    # Important:
-    # Do NOT call /server/healthcheck/ here.
-    # Psono can rate-limit that endpoint and return 429 during repeated checks/imports.
     healthcheck:
       test:
         - CMD-SHELL
@@ -270,8 +261,6 @@ services:
 
         domain = os.getenv("PSONO_DOMAIN_RAW", "vault.example.com").strip()
 
-        # Keep register/backend domain equal to server domain.
-        # This avoids client/API mismatch problems.
         user_domain = os.getenv("PSONO_USER_DOMAIN_RAW", domain).strip()
         if not user_domain or user_domain == "*":
             user_domain = domain
@@ -319,6 +308,52 @@ services:
         PY
         }
 
+        patch_psono_header_container() {
+          python3 - <<'PY'
+        import base64
+        import os
+
+        try:
+            js_b64 = "KGZ1bmN0aW9uICgpIHsKICBmdW5jdGlvbiBwYXRjaEhlYWRlckNvbnRhaW5lcigpIHsKICAgIHZhciBub2RlcyA9IGRvY3VtZW50LnF1ZXJ5U2VsZWN0b3JBbGwoImhlYWRlciAuTXVpQ29udGFpbmVyLXJvb3QuTXVpQ29udGFpbmVyLW1heFdpZHRoTGciKTsKCiAgICBub2Rlcy5mb3JFYWNoKGZ1bmN0aW9uIChub2RlKSB7CiAgICAgIGlmIChub2RlLmNsYXNzTGlzdC5jb250YWlucygiY3NzLTFxc3hpaDIiKSkgewogICAgICAgIG5vZGUuY2xhc3NMaXN0LnJlbW92ZSgiY3NzLTFxc3hpaDIiKTsKICAgICAgfQogICAgfSk7CiAgfQoKICBwYXRjaEhlYWRlckNvbnRhaW5lcigpOwoKICB2YXIgb2JzZXJ2ZXIgPSBuZXcgTXV0YXRpb25PYnNlcnZlcihmdW5jdGlvbiAoKSB7CiAgICBwYXRjaEhlYWRlckNvbnRhaW5lcigpOwogIH0pOwoKICBvYnNlcnZlci5vYnNlcnZlKGRvY3VtZW50LmRvY3VtZW50RWxlbWVudCwgewogICAgY2hpbGRMaXN0OiB0cnVlLAogICAgc3VidHJlZTogdHJ1ZSwKICAgIGF0dHJpYnV0ZXM6IHRydWUsCiAgICBhdHRyaWJ1dGVGaWx0ZXI6IFsiY2xhc3MiXQogIH0pOwp9KSgpOwo="
+
+            js_path = "/usr/share/nginx/html/remove-header-mui-class.js"
+
+            os.makedirs(os.path.dirname(js_path), exist_ok=True)
+
+            with open(js_path, "wb") as f:
+                f.write(base64.b64decode(js_b64))
+
+            for html_path in [
+                "/usr/share/nginx/html/index.html",
+                "/usr/share/nginx/html/portal/index.html",
+            ]:
+                if not os.path.exists(html_path):
+                    continue
+
+                with open(html_path, "r", encoding="utf-8") as f:
+                    html = f.read()
+
+                if "remove-header-mui-class.js" not in html:
+                    if "</body>" in html:
+                        html = html.replace(
+                            "</body>",
+                            '<script src="/remove-header-mui-class.js"></script></body>'
+                        )
+                    else:
+                        html += '<script src="/remove-header-mui-class.js"></script>'
+
+                    with open(html_path, "w", encoding="utf-8") as f:
+                        f.write(html)
+
+            print("Header patch applied or already present.")
+        except Exception as exc:
+            print(f"Header patch skipped: {exc}")
+        PY
+        }
+
+        echo "Patching Psono header container..."
+        patch_psono_header_container || echo "Header patch skipped."
+
         echo "Writing Psono web client config.json..."
         CONFIG_JSON="$$(write_psono_config)"
 
@@ -358,6 +393,7 @@ services:
 
         for i in $$(seq 1 60); do
           write_psono_config >/dev/null || true
+          patch_psono_header_container >/dev/null || true
           sleep 1
         done
 
